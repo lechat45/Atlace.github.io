@@ -1,7 +1,7 @@
 import { useState, useRef, useEffect } from 'react'
 import { useAuth } from '../hooks/useAuth'
 import { useProjects } from '../hooks/useProjects'
-import { askAI, getActiveProvider, getActiveModel, parseAIError } from '../lib/ai'
+import { askAIStream, getActiveProvider, getActiveModel, parseAIError } from '../lib/ai'
 import { useToast } from '../components/ui/Toast'
 import Icon from '../components/icons/Icon'
 
@@ -107,10 +107,21 @@ export default function AIStudio() {
         content: m.content,
       }))
 
-      const reply = await askAI(sysPrompt, history, userMsg, model)
+      const placeholderTs = Date.now() + 1
+      setConversations(prev => prev.map(c => c.id === activeConvId
+        ? { ...c, messages: [...c.messages, { role: 'assistant', content: '', ts: placeholderTs, streaming: true }] }
+        : c
+      ))
+
+      await askAIStream(sysPrompt, history, userMsg, model, (_tok, full) => {
+        setConversations(prev => prev.map(c => c.id === activeConvId
+          ? { ...c, messages: c.messages.map(m => m.ts === placeholderTs ? { ...m, content: full } : m) }
+          : c
+        ))
+      })
 
       setConversations(prev => prev.map(c => c.id === activeConvId
-        ? { ...c, messages: [...c.messages, { role: 'assistant', content: reply, ts: Date.now() }] }
+        ? { ...c, messages: c.messages.map(m => m.ts === placeholderTs ? { ...m, streaming: false } : m) }
         : c
       ))
     } catch (err) {
@@ -241,6 +252,9 @@ export default function AIStudio() {
                   {msg.role === 'user' ? initial : (activeProvider.label.split(' ')[0] + ' · ' + (providerModels.find(m => m.id === model)?.label?.split(' ')[0] || 'AI')).toUpperCase()}
                 </div>
                 <MsgContent content={msg.content}/>
+                {msg.streaming && (
+                  <span style={{ display: 'inline-block', width: 7, height: 14, background: 'var(--accent)', borderRadius: 2, verticalAlign: 'text-bottom', marginLeft: 3, animation: 'pulseDot 0.7s ease-in-out infinite' }}/>
+                )}
               </div>
               {msg.role === 'user' && (
                 <div style={{

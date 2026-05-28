@@ -78,27 +78,35 @@ const AIChat = forwardRef(function AIChat(
   const [model, setModel]       = useState(() => getActiveModel())
   const bottomRef  = useRef(null)
   const doSendRef  = useRef(null)   // always-fresh ref to doSend
+  const msgIdRef   = useRef(0)      // monotonic counter — guarantees unique keys
   const toast      = useToast()
+
+  function nextId() { return ++msgIdRef.current }
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages])
 
   function buildHistory() {
+    // Keep last 10 messages max and truncate long messages to avoid 413
     return messages
       .filter(m => !m.isError && !m.streaming)
-      .map(m => ({ role: m.role === 'user' ? 'user' : 'assistant', content: m.content }))
+      .slice(-10)
+      .map(m => ({
+        role: m.role === 'user' ? 'user' : 'assistant',
+        content: (m.content || '').slice(0, 800),   // cap each message at 800 chars
+      }))
   }
 
   async function doSend(userMsg) {
     if (!userMsg?.trim() || loading) return
-    const msg = userMsg.trim()
+    const msg       = userMsg.trim()
+    const userId    = nextId()
+    const assistId  = nextId()
     setInput('')
-    setMessages(prev => [...prev, { role: 'user', content: msg, ts: Date.now() }])
+    setMessages(prev => [...prev, { role: 'user', content: msg, id: userId }])
     setLoading(true)
-
-    const placeholderTs = Date.now() + 1
-    setMessages(prev => [...prev, { role: 'assistant', content: '', ts: placeholderTs, streaming: true }])
+    setMessages(prev => [...prev, { role: 'assistant', content: '', id: assistId, streaming: true }])
 
     try {
       const history  = buildHistory()
@@ -108,18 +116,18 @@ const AIChat = forwardRef(function AIChat(
 
       await askAIStream(sysPrompt, history, msg, model, (_token, full) => {
         setMessages(prev => prev.map(m =>
-          m.ts === placeholderTs ? { ...m, content: full } : m
+          m.id === assistId ? { ...m, content: full } : m
         ))
       })
 
       setMessages(prev => prev.map(m =>
-        m.ts === placeholderTs ? { ...m, streaming: false } : m
+        m.id === assistId ? { ...m, streaming: false } : m
       ))
     } catch (err) {
       const friendly = parseAIError(err)
       toast(friendly, 'error')
       setMessages(prev => prev.map(m =>
-        m.ts === placeholderTs
+        m.id === assistId
           ? { ...m, content: friendly, streaming: false, isError: true }
           : m
       ))
@@ -223,7 +231,7 @@ const AIChat = forwardRef(function AIChat(
 
         {/* Message bubbles */}
         {messages.map((msg) => (
-          <div key={msg.ts} style={{ display: 'flex', gap: 8, flexDirection: msg.role === 'user' ? 'row-reverse' : 'row' }}>
+          <div key={msg.id} style={{ display: 'flex', gap: 8, flexDirection: msg.role === 'user' ? 'row-reverse' : 'row' }}>
             <div style={{
               width: 26, height: 26, borderRadius: '50%', display: 'grid', placeItems: 'center', flexShrink: 0,
               background: msg.role === 'user' ? 'var(--surface-2)' : 'var(--accent-soft)',

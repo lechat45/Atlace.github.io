@@ -197,8 +197,9 @@ window.onunhandledrejection=e=>{_p('error','UnhandledPromiseRejection: '+(e.reas
 
 // ── Component ─────────────────────────────────────────────
 export default function CodePreview({ files, language, onAIFix }) {
-  const [output, setOutput] = useState([])
-  const [running, setRunning] = useState(false)
+  const [output,    setOutput]    = useState([])
+  const [running,   setRunning]   = useState(false)
+  const [logFilter, setLogFilter] = useState('all') // all|log|warn|error
   const iframeRef = useRef(null)
   const outputRef = useRef(null)
   const runningRef = useRef(false)
@@ -406,6 +407,21 @@ export default function CodePreview({ files, language, onAIFix }) {
           )}
         </div>
         <div style={{ display: 'flex', gap: 5 }}>
+          {/* Filter chips */}
+          {output.length > 0 && (
+            <div style={{ display: 'flex', gap: 3 }}>
+              {['all','log','warn','error'].map(f => {
+                const counts = { all: output.length, log: output.filter(o=>o.type==='log').length, warn: output.filter(o=>o.type==='warn').length, error: output.filter(o=>o.type==='error').length }
+                const colors = { all: 'var(--text-2)', log: 'var(--text-2)', warn: '#f59e0b', error: 'var(--danger)' }
+                if (f !== 'all' && counts[f] === 0) return null
+                return (
+                  <button key={f} onClick={() => setLogFilter(f)} style={{ height: 20, padding: '0 7px', borderRadius: 99, fontSize: 10, border: `1px solid ${logFilter === f ? colors[f] : 'var(--border-1)'}`, background: logFilter === f ? colors[f] + '18' : 'transparent', color: logFilter === f ? colors[f] : 'var(--text-4)', cursor: 'pointer', fontFamily: 'Fira Code' }}>
+                    {f === 'all' ? `Tout (${counts.all})` : f === 'error' ? `✗ ${counts.error}` : f === 'warn' ? `⚠ ${counts.warn}` : `› ${counts.log}`}
+                  </button>
+                )
+              })}
+            </div>
+          )}
           <button className="btn btn-ghost btn-sm" onClick={clear} style={{ gap: 4, fontSize: 11 }}>
             <Icon name="refresh" size={10}/> Reset
           </button>
@@ -457,7 +473,7 @@ export default function CodePreview({ files, language, onAIFix }) {
             )}
           </div>
         )}
-        {output.map(({ msg, type, ts }) => (
+        {output.filter(o => logFilter === 'all' || o.type === logFilter).map(({ msg, type, ts }) => (
           <div key={ts} style={{ display: 'flex', gap: 0, marginBottom: 1 }}>
             <pre className="mono" style={{
               margin: 0, fontSize: 11.5, color: logColor(type), lineHeight: 1.75,

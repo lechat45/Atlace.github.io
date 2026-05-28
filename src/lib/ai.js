@@ -18,12 +18,12 @@ export const AI_PROVIDERS = [
     color: 'var(--accent)',
     requiresKey: false,
     models: [
-      { id: 'llama-3.3-70b-versatile',      label: 'Llama 3.3 70B (recommandé)' },
-      { id: 'llama-3.1-8b-instant',          label: 'Llama 3.1 8B (rapide)' },
-      { id: 'deepseek-r1-distill-llama-70b', label: 'DeepSeek R1 70B (raisonnement)' },
-      { id: 'llama-3.2-11b-vision-preview',  label: 'Llama 3.2 11B Vision' },
+      { id: 'openai/gpt-oss-120b',      label: 'GPT-OSS 120B ★ Meilleur code' },
+      { id: 'openai/gpt-oss-20b',       label: 'GPT-OSS 20B (ultra-rapide)' },
+      { id: 'llama-3.3-70b-versatile',  label: 'Llama 3.3 70B (polyvalent)' },
+      { id: 'llama-3.1-8b-instant',     label: 'Llama 3.1 8B (rapide)' },
     ],
-    defaultModel: 'llama-3.3-70b-versatile',
+    defaultModel: 'openai/gpt-oss-120b',
   },
   {
     id: 'groq-custom',
@@ -34,12 +34,12 @@ export const AI_PROVIDERS = [
     requiresKey: true,
     keyPlaceholder: 'gsk_...',
     models: [
-      { id: 'llama-3.3-70b-versatile',      label: 'Llama 3.3 70B' },
-      { id: 'llama-3.1-8b-instant',          label: 'Llama 3.1 8B (rapide)' },
-      { id: 'deepseek-r1-distill-llama-70b', label: 'DeepSeek R1 70B' },
-      { id: 'llama-3.2-11b-vision-preview',  label: 'Llama 3.2 11B Vision' },
+      { id: 'openai/gpt-oss-120b',      label: 'GPT-OSS 120B ★ Meilleur code' },
+      { id: 'openai/gpt-oss-20b',       label: 'GPT-OSS 20B (ultra-rapide)' },
+      { id: 'llama-3.3-70b-versatile',  label: 'Llama 3.3 70B (polyvalent)' },
+      { id: 'llama-3.1-8b-instant',     label: 'Llama 3.1 8B (rapide)' },
     ],
-    defaultModel: 'llama-3.3-70b-versatile',
+    defaultModel: 'openai/gpt-oss-120b',
   },
   {
     id: 'openai',
@@ -90,54 +90,110 @@ export function getActiveProvider() {
   return AI_PROVIDERS.find(p => p.id === provider) || AI_PROVIDERS[0]
 }
 
+// Models that have been decommissioned — auto-reset to default
+const DECOMMISSIONED_MODELS = [
+  'qwen-qwq-32b', 'qwen/qwen3-32b', 'moonshotai/kimi-k1.5-32b-preview',
+  'deepseek-r1-distill-llama-70b', 'deepseek-r1-distill-qwen-32b',
+  'meta-llama/llama-4-scout-17b-16e-instruct',
+  'meta-llama/llama-4-maverick-17b-128e-instruct',
+]
+
 export function getActiveModel() {
-  const pref = getAIPref()
+  const pref     = getAIPref()
   const provider = getActiveProvider()
-  // Verify the saved model is valid for the current provider
   const validIds = provider.models.map(m => m.id)
-  return validIds.includes(pref.model) ? pref.model : provider.defaultModel
+  // If saved model is decommissioned or no longer in the list → reset to default
+  if (!pref.model || DECOMMISSIONED_MODELS.includes(pref.model) || !validIds.includes(pref.model)) {
+    setAIPref({ model: provider.defaultModel })
+    return provider.defaultModel
+  }
+  return pref.model
+}
+
+// ── Hard budget: prevent 413 errors ───────────────────────
+// Conservative: ~6 000 chars total input (~1 500 tokens).
+// Groq 413 = input_tokens + max_tokens > model context window.
+// By keeping input small, we leave room for the output.
+const MAX_REQUEST_CHARS = 6_000
+
+function safeTrim(systemPrompt, history, userMessage) {
+  let sys  = (systemPrompt || '').slice(0, 1500)   // system prompt cap
+  let user = (userMessage  || '').slice(0, 2000)   // user message cap
+  let hist = (history || []).slice(-6)             // keep only last 6 messages
+
+  // Drop oldest history entries until total fits
+  while (hist.length > 0) {
+    const total = sys.length + user.length +
+      hist.reduce((n, m) => n + (m.content || '').length, 0)
+    if (total <= MAX_REQUEST_CHARS) break
+    hist = hist.slice(1)
+  }
+
+  // Truncate remaining history messages to stay under budget
+  const budget = MAX_REQUEST_CHARS - sys.length - user.length
+  let used = 0
+  hist = hist.map(m => {
+    const cap  = Math.max(0, budget - used)
+    const text = (m.content || '').slice(0, Math.min(400, cap))
+    used += text.length
+    return { ...m, content: text }
+  })
+
+  return { sys, hist, user }
+}
+
+// ── Strip <think>…</think> reasoning blocks ────────────────
+// Models like DeepSeek-R1 and QwQ emit a thinking block before the answer.
+// We strip it so only the actual reply is returned.
+export function stripThinking(text) {
+  return (text || '').replace(/<think>[\s\S]*?<\/think>/gi, '').trim()
 }
 
 // ── Main call ──────────────────────────────────────────────
 export async function askAI(systemPrompt, history, userMessage, modelOverride) {
-  const pref   = getAIPref()
+  const pref     = getAIPref()
   const provider = getActiveProvider()
-  const model  = modelOverride || getActiveModel()
+  const model    = modelOverride || getActiveModel()
+  const { sys, hist, user } = safeTrim(systemPrompt, history, userMessage)
 
   if (provider.id === 'groq-builtin') {
-    return _callGroq(BUILTIN_GROQ_KEY, systemPrompt, history, userMessage, model)
+    return _callGroq(BUILTIN_GROQ_KEY, sys, hist, user, model)
   }
   if (provider.id === 'groq-custom') {
     const key = pref.apiKey?.trim()
     if (!key) throw new Error('Clé Groq manquante — configurez-la dans Paramètres → Moteur IA.')
-    return _callGroq(key, systemPrompt, history, userMessage, model)
+    return _callGroq(key, sys, hist, user, model)
   }
   if (provider.id === 'openai') {
     const key = pref.apiKey?.trim()
     if (!key) throw new Error('Clé OpenAI manquante — configurez-la dans Paramètres → Moteur IA.')
-    return _callOpenAI(key, systemPrompt, history, userMessage, model)
+    return _callOpenAI(key, sys, hist, user, model)
   }
   if (provider.id === 'anthropic') {
     const key = pref.apiKey?.trim()
     if (!key) throw new Error('Clé Anthropic manquante — configurez-la dans Paramètres → Moteur IA.')
-    return _callAnthropic(key, systemPrompt, history, userMessage, model)
+    return _callAnthropic(key, sys, hist, user, model)
   }
   throw new Error('Fournisseur IA inconnu : ' + provider.id)
 }
 
 // ── Provider implementations ───────────────────────────────
-async function _callGroq(apiKey, systemPrompt, history, userMessage, model) {
+async function _callGroq(apiKey, systemPrompt, history, userMessage, model, opts = {}) {
   const client = new Groq({ apiKey, dangerouslyAllowBrowser: true })
   const messages = [
     ...(systemPrompt ? [{ role: 'system', content: systemPrompt }] : []),
     ...history,
     { role: 'user', content: userMessage },
   ]
-  const completion = await client.chat.completions.create({ model, messages, max_tokens: 4096 })
+  const completion = await client.chat.completions.create({
+    model, messages,
+    max_tokens:  opts.maxTokens  ?? 2048,
+    temperature: opts.temperature ?? 0.6,
+  })
   return completion.choices[0]?.message?.content || ''
 }
 
-async function _callOpenAI(apiKey, systemPrompt, history, userMessage, model) {
+async function _callOpenAI(apiKey, systemPrompt, history, userMessage, model, opts = {}) {
   const messages = [
     ...(systemPrompt ? [{ role: 'system', content: systemPrompt }] : []),
     ...history,
@@ -146,7 +202,7 @@ async function _callOpenAI(apiKey, systemPrompt, history, userMessage, model) {
   const res = await fetch('https://api.openai.com/v1/chat/completions', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
-    body: JSON.stringify({ model, messages, max_tokens: 4096 }),
+    body: JSON.stringify({ model, messages, max_tokens: opts.maxTokens ?? 2048, temperature: opts.temperature ?? 0.7 }),
   })
   if (!res.ok) {
     const e = await res.json().catch(() => ({}))
@@ -156,7 +212,7 @@ async function _callOpenAI(apiKey, systemPrompt, history, userMessage, model) {
   return data.choices[0]?.message?.content || ''
 }
 
-async function _callAnthropic(apiKey, systemPrompt, history, userMessage, model) {
+async function _callAnthropic(apiKey, systemPrompt, history, userMessage, model, opts = {}) {
   const res = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     headers: {
@@ -166,7 +222,8 @@ async function _callAnthropic(apiKey, systemPrompt, history, userMessage, model)
       'anthropic-dangerous-direct-browser-access': 'true',
     },
     body: JSON.stringify({
-      model, max_tokens: 4096,
+      model, max_tokens: opts.maxTokens ?? 2048,
+      ...(opts.temperature !== undefined ? { temperature: opts.temperature } : {}),
       ...(systemPrompt ? { system: systemPrompt } : {}),
       messages: [...history, { role: 'user', content: userMessage }],
     }),
@@ -180,28 +237,30 @@ async function _callAnthropic(apiKey, systemPrompt, history, userMessage, model)
 }
 
 // ── Streaming call ─────────────────────────────────────────
-export async function askAIStream(systemPrompt, history, userMessage, model, onChunk) {
+// opts: { temperature?: number, maxTokens?: number }
+export async function askAIStream(systemPrompt, history, userMessage, model, onChunk, opts = {}) {
   const pref     = getAIPref()
   const provider = getActiveProvider()
   const m        = model || getActiveModel()
+  const { sys, hist, user } = safeTrim(systemPrompt, history, userMessage)
 
   if (provider.id === 'groq-builtin') {
-    return _callGroqStream(BUILTIN_GROQ_KEY, systemPrompt, history, userMessage, m, onChunk)
+    return _callGroqStream(BUILTIN_GROQ_KEY, sys, hist, user, m, onChunk, opts)
   }
   if (provider.id === 'groq-custom') {
     const key = pref.apiKey?.trim()
     if (!key) throw new Error('Clé Groq manquante — configurez-la dans Paramètres → Moteur IA.')
-    return _callGroqStream(key, systemPrompt, history, userMessage, m, onChunk)
+    return _callGroqStream(key, sys, hist, user, m, onChunk, opts)
   }
   if (provider.id === 'openai') {
     const key = pref.apiKey?.trim()
     if (!key) throw new Error('Clé OpenAI manquante — configurez-la dans Paramètres → Moteur IA.')
-    return _callOpenAIStream(key, systemPrompt, history, userMessage, m, onChunk)
+    return _callOpenAIStream(key, sys, hist, user, m, onChunk, opts)
   }
   if (provider.id === 'anthropic') {
     const key = pref.apiKey?.trim()
     if (!key) throw new Error('Clé Anthropic manquante — configurez-la dans Paramètres → Moteur IA.')
-    return _callAnthropicStream(key, systemPrompt, history, userMessage, m, onChunk)
+    return _callAnthropicStream(key, sys, hist, user, m, onChunk, opts)
   }
   // Unknown provider — fallback to non-streaming
   const reply = await askAI(systemPrompt, history, userMessage, model)
@@ -209,14 +268,18 @@ export async function askAIStream(systemPrompt, history, userMessage, model, onC
   return reply
 }
 
-async function _callGroqStream(apiKey, systemPrompt, history, userMessage, model, onChunk) {
+async function _callGroqStream(apiKey, systemPrompt, history, userMessage, model, onChunk, opts = {}) {
   const client = new Groq({ apiKey, dangerouslyAllowBrowser: true })
   const messages = [
     ...(systemPrompt ? [{ role: 'system', content: systemPrompt }] : []),
     ...history,
     { role: 'user', content: userMessage },
   ]
-  const stream = await client.chat.completions.create({ model, messages, max_tokens: 4096, stream: true })
+  const stream = await client.chat.completions.create({
+    model, messages, stream: true,
+    max_tokens:  opts.maxTokens  ?? 2048,
+    temperature: opts.temperature ?? 0.6,
+  })
   let full = ''
   for await (const chunk of stream) {
     const token = chunk.choices[0]?.delta?.content || ''
@@ -225,7 +288,7 @@ async function _callGroqStream(apiKey, systemPrompt, history, userMessage, model
   return full
 }
 
-async function _callOpenAIStream(apiKey, systemPrompt, history, userMessage, model, onChunk) {
+async function _callOpenAIStream(apiKey, systemPrompt, history, userMessage, model, onChunk, opts = {}) {
   const messages = [
     ...(systemPrompt ? [{ role: 'system', content: systemPrompt }] : []),
     ...history,
@@ -234,7 +297,7 @@ async function _callOpenAIStream(apiKey, systemPrompt, history, userMessage, mod
   const res = await fetch('https://api.openai.com/v1/chat/completions', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
-    body: JSON.stringify({ model, messages, max_tokens: 4096, stream: true }),
+    body: JSON.stringify({ model, messages, max_tokens: opts.maxTokens ?? 2048, temperature: opts.temperature ?? 0.7, stream: true }),
   })
   if (!res.ok) {
     const e = await res.json().catch(() => ({}))
@@ -262,7 +325,7 @@ async function _callOpenAIStream(apiKey, systemPrompt, history, userMessage, mod
   return full
 }
 
-async function _callAnthropicStream(apiKey, systemPrompt, history, userMessage, model, onChunk) {
+async function _callAnthropicStream(apiKey, systemPrompt, history, userMessage, model, onChunk, opts = {}) {
   const res = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     headers: {
@@ -272,7 +335,8 @@ async function _callAnthropicStream(apiKey, systemPrompt, history, userMessage, 
       'anthropic-dangerous-direct-browser-access': 'true',
     },
     body: JSON.stringify({
-      model, max_tokens: 4096, stream: true,
+      model, max_tokens: opts.maxTokens ?? 2048, stream: true,
+      ...(opts.temperature !== undefined ? { temperature: opts.temperature } : {}),
       ...(systemPrompt ? { system: systemPrompt } : {}),
       messages: [...history, { role: 'user', content: userMessage }],
     }),
