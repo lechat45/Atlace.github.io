@@ -111,7 +111,7 @@ export default function App() {
 
   return (
     <ToastProvider>
-      <BrowserRouter basename="/Atlace.github.io" future={{ v7_relativeSplatPath: true, v7_startTransition: true }}>
+      <BrowserRouter basename={import.meta.env.BASE_URL} future={{ v7_relativeSplatPath: true, v7_startTransition: true }}>
         <Routes>
           <Route path="/" element={<Landing/>}/>
           <Route path="/login"    element={<PublicRoute><Login/></PublicRoute>}/>

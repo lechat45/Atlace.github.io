@@ -1,9 +1,10 @@
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 
-export default defineConfig({
+export default defineConfig(({ command }) => ({
   plugins: [react()],
-  base: '/Atlace.github.io/',
+  // dev → '/'  |  build (GitHub Pages) → '/Atlace.github.io/'
+  base: command === 'serve' ? '/' : '/Atlace.github.io/',
   build: {
     outDir: 'dist',
     rollupOptions: {
@@ -16,4 +17,4 @@ export default defineConfig({
       }
     }
   }
-})
+}))
