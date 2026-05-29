@@ -275,11 +275,16 @@ async function _callGroqStream(apiKey, systemPrompt, history, userMessage, model
     ...history,
     { role: 'user', content: userMessage },
   ]
-  const stream = await client.chat.completions.create({
-    model, messages, stream: true,
-    max_tokens:  opts.maxTokens  ?? 2048,
-    temperature: opts.temperature ?? 0.6,
-  })
+
+  const stream = await withRetry(
+    () => client.chat.completions.create({
+      model, messages, stream: true,
+      max_tokens:  opts.maxTokens  ?? 2048,
+      temperature: opts.temperature ?? 0.6,
+    }),
+    { maxAttempts: 3, onWait: opts.onWait }
+  )
+
   let full = ''
   for await (const chunk of stream) {
     const token = chunk.choices[0]?.delta?.content || ''
@@ -365,6 +370,33 @@ async function _callAnthropicStream(apiKey, systemPrompt, history, userMessage, 
     }
   }
   return full
+}
+
+// ── Rate-limit retry helper ────────────────────────────────
+// Parses "Please try again in 17.865s" → 17865 ms
+function parseRetryDelay(errMsg = '') {
+  const m = errMsg.match(/try again in (\d+(?:\.\d+)?)s/i)
+  if (m) return Math.ceil(parseFloat(m[1]) * 1000) + 1200  // +1.2s safety buffer
+  return 20_000 // fallback: 20 s
+}
+
+// Retry a Groq call up to `maxAttempts` times on 429.
+// onWait(ms) is called before each wait so the UI can show a countdown.
+export async function withRetry(fn, { maxAttempts = 3, onWait } = {}) {
+  let attempt = 0
+  while (true) {
+    try {
+      return await fn()
+    } catch (err) {
+      const msg = err?.message || ''
+      const is429 = msg.includes('429') || msg.includes('rate_limit_exceeded') || msg.includes('rate limit')
+      attempt++
+      if (!is429 || attempt >= maxAttempts) throw err
+      const delay = parseRetryDelay(msg)
+      if (onWait) onWait(delay)
+      await new Promise(r => setTimeout(r, delay))
+    }
+  }
 }
 
 // ── Error formatter ────────────────────────────────────────
