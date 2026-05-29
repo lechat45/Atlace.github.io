@@ -146,47 +146,54 @@ Planifie les étapes de développement.`,
   }
 
   // ── Code generation prompt ─────────────────────────────────
-  function buildCodePrompt(todo, parsedTodos, oldContent, lang) {
-    const oldLines    = oldContent ? oldContent.split('\n').length : 0
-    const minLines    = Math.max(10, Math.floor(oldLines * 0.9))
-    const contentSnip = oldContent.slice(0, 3000)
-    const wasCut      = oldContent.length > 3000
+  // KEY FIX: show the FULL file — no char limit.
+  // Truncating to 3000 chars was the root cause: the AI only saw
+  // ~250 lines of a 300-line file and "invented" the rest.
+  function buildCodePrompt(todo, parsedTodos, oldContent, lang, { strict = false } = {}) {
+    const oldLines = oldContent ? oldContent.split('\n').length : 0
+    const minLines = Math.max(10, Math.floor(oldLines * 0.85))
 
     const otherCtx = filesRef.current
       .filter(f => f.filename !== todo.file)
       .slice(0, 3)
-      .map(f => {
-        const snip = (f.content || '').slice(0, 200).replace(/\n/g, ' ')
-        return `// ${f.filename}: ${snip}…`
-      })
+      .map(f => `// ${f.filename}: ${(f.content || '').split('\n').slice(0, 5).join(' ').slice(0, 160)}…`)
       .join('\n')
 
-    const sys = `Tu es un développeur senior expert en ${lang}. Tu génères du code de production, complet, propre et fonctionnel.
+    // Strict mode is used on retry when truncation was detected
+    const strictBlock = strict ? `
+⚠ ATTENTION RETRY: Ta précédente réponse avait trop peu de lignes.
+Le fichier ORIGINAL fait ${oldLines} lignes. Ta réponse DOIT en avoir au moins ${minLines}.
+Chaque ligne du fichier original doit être présente dans ta réponse, sauf celles explicitement modifiées par cette étape.
+` : ''
 
-CONTEXTE DU PROJET:
-- Nom: "${project?.name || 'projet'}"
-- Langage principal: ${project?.main_language || 'JS'}
-- Tâche globale: ${task}
-- Cette étape (${todo.step}/${parsedTodos.length}): ${todo.title}
-- Fichier cible: ${todo.file}
+    const sys = `Tu es un éditeur de code de précision chirurgicale. Tu modifies UNIQUEMENT ce qui est demandé.
+${strictBlock}
+PHILOSOPHIE FONDAMENTALE:
+Ta réponse = copie exacte de l'original + SEULEMENT les modifications de cette étape.
+Toute ligne qui n'est PAS concernée par la modification doit être IDENTIQUE à l'original.
 
-CONTENU ACTUEL DU FICHIER (${oldLines} lignes):
+PROJET: "${project?.name || 'projet'}" · ${project?.main_language || 'JS'}
+TÂCHE GLOBALE: ${task}
+ÉTAPE ${todo.step}/${parsedTodos.length}: ${todo.title}
+FICHIER: ${todo.file} (${lang}) · ${oldLines} lignes
+${otherCtx ? `\nFICHIERS CONNEXES (contexte):\n${otherCtx}\n` : ''}
+FICHIER ORIGINAL COMPLET — ${oldLines} lignes (CONSERVE TOUT):
 \`\`\`${lang}
-${contentSnip}${wasCut ? `\n// ... (${oldContent.length - 3000} caractères supplémentaires — CONSERVE TOUT CE CODE)` : ''}
+${oldContent || '// fichier vide — crée le contenu approprié'}
 \`\`\`
-${otherCtx ? `\nAUTRES FICHIERS (contexte):\n${otherCtx}\n` : ''}
-RÈGLES ABSOLUES — toute violation invalide ta réponse:
-① Réponds UNIQUEMENT avec le bloc de code \`\`\`${lang}....\`\`\` — zéro texte avant ou après
-② GÉNÈRE LE FICHIER ENTIER de la première à la dernière ligne
-③ Minimum ${minLines} lignes (fichier actuel: ${oldLines} lignes) — ne supprime AUCUNE fonctionnalité existante
-④ INTERDIT: "...", "// existing code here", "// reste inchangé", "// TODO", commentaires placeholder
-⑤ Tout le code doit être fonctionnel — pas de fonctions vides, pas de stubs
-⑥ Conserve TOUTES les imports, exports, fonctions et logique existants
-⑦ N'ajoute que ce qui est demandé dans l'étape, ne modifie pas le reste`
 
-    const user = `Génère le fichier COMPLET "${todo.file}" avec les modifications suivantes: ${todo.title}.
+RÈGLES ABSOLUES (violation = réponse invalide):
+① Réponds UNIQUEMENT avec \`\`\`${lang}\\n...\\n\`\`\` — zéro texte avant ou après
+② Génère LE FICHIER ENTIER, première ligne jusqu'à la dernière
+③ MINIMUM ${minLines} lignes — le fichier original en a ${oldLines}
+④ INTERDIT: "...", "// reste du code", "// existing code", "// unchanged", placeholders
+⑤ INTERDIT: supprimer des imports, des fonctions ou de la logique existante
+⑥ Seules les lignes directement liées à "${todo.title}" peuvent changer
+⑦ Code 100% fonctionnel, aucune fonction vide ou stub`
 
-Le fichier doit contenir les ${oldLines > 0 ? oldLines + ' lignes existantes PLUS' : ''} les nouvelles modifications. Commence directement par \`\`\`${lang}`
+    const user = `Modifie "${todo.file}" pour: ${todo.title}
+
+Rappel: le fichier original fait ${oldLines} lignes. Commence directement par \`\`\`${lang}`
 
     return { sys, user }
   }
@@ -248,24 +255,28 @@ Le fichier doit contenir les ${oldLines > 0 ? oldLines + ' lignes existantes PLU
       const ext         = (todo.file || 'index.js').split('.').pop()?.toLowerCase() || 'js'
       const lang        = { js: 'javascript', jsx: 'javascript', ts: 'typescript', tsx: 'typescript', py: 'python', css: 'css', html: 'html', json: 'json', md: 'markdown' }[ext] || ext
 
-      const { sys: codeSys, user: codeUser } = buildCodePrompt(todo, parsedTodos, oldContent, lang)
-
-      let stepText = ''
-      try {
+      // Helper: run one code-generation attempt
+      const runCodeStep = async (strict = false) => {
+        const { sys: codeSys, user: codeUser } = buildCodePrompt(todo, parsedTodos, oldContent, lang, { strict })
+        let stepText = ''
         setWaitMs(0)
         await streamWithRetry(
           codeSys, codeUser,
           (_t, full) => { stepText = full; setStreamText(full) },
           (ms) => {
-            // Mark this step as waiting so UX shows countdown
             setTodos(prev => prev.map((t, i) => i === idx ? { ...t, status: 'waiting' } : t))
             onWait(ms)
           },
-          { temperature: 0, maxTokens: 6000 }
+          { temperature: 0, maxTokens: 8000 }
         )
-        // Restore running status after wait
         setTodos(prev => prev.map((t, i) => i === idx ? { ...t, status: 'running' } : t))
         setWaitMs(0)
+        return stepText
+      }
+
+      let stepText = ''
+      try {
+        stepText = await runCodeStep(false)
       } catch (err) {
         addLog(`❌ Étape ${todo.step} échouée : ${err.message}`, 'error')
         setTodos(prev => prev.map((t, i) => i === idx ? { ...t, status: 'error' } : t))
@@ -274,14 +285,34 @@ Le fichier doit contenir les ${oldLines > 0 ? oldLines + ' lignes existantes PLU
       }
 
       setStreamText('')
-      const newContent = extractCode(stripThinking(stepText))
-      const filename   = todo.file || `step${todo.step}.js`
-      const oldLines   = oldContent ? oldContent.split('\n').length : 0
-      const newLines   = newContent ? newContent.split('\n').length : 0
+      let newContent = extractCode(stripThinking(stepText))
+      const filename  = todo.file || `step${todo.step}.js`
+      const oldLines  = oldContent ? oldContent.split('\n').length : 0
+      let   newLines  = newContent ? newContent.split('\n').length : 0
 
-      // Warn if severely truncated
+      // ── Auto-retry if output was severely truncated ──────
+      if (oldLines > 20 && newLines < oldLines * 0.75) {
+        addLog(`⚠ Truncation détectée (${oldLines}→${newLines} lignes) — 2e tentative…`, 'warn')
+        try {
+          const retryText = await runCodeStep(true)   // strict=true adds extra warning
+          setStreamText('')
+          const retryContent = extractCode(stripThinking(retryText))
+          const retryLines   = retryContent ? retryContent.split('\n').length : 0
+          if (retryLines > newLines) {
+            addLog(`↻ Retry : ${newLines}→${retryLines} lignes`, 'info')
+            newContent = retryContent
+            newLines   = retryLines
+          } else {
+            addLog(`↻ Retry inchangé (${retryLines} lignes) — conserve 1ère tentative`, 'warn')
+          }
+        } catch (err) {
+          addLog(`⚠ Retry échoué : ${err.message}`, 'warn')
+        }
+      }
+
+      // Still very short → warn but continue with best result
       if (oldLines > 20 && newLines < oldLines * 0.6) {
-        addLog(`⚠ ${filename} : truncation détectée (${oldLines}→${newLines} lignes)`, 'error')
+        addLog(`⚠ ${filename} : possible perte de code (${oldLines}→${newLines} lignes)`, 'error')
       }
 
       if (!newContent.trim()) {
@@ -294,7 +325,7 @@ Le fichier doit contenir les ${oldLines > 0 ? oldLines + ' lignes existantes PLU
       collectedChanges.push({ filename, oldContent, newContent })
       setGeneratedFiles(prev => [...prev, { filename, status: 'done', lines: newLines }])
       setTodos(prev => prev.map((t, i) => i === idx ? { ...t, status: 'done' } : t))
-      addLog(`✅ ${filename} — ${newLines} lignes`)
+      addLog(`✅ ${filename} — ${newLines} lignes${oldLines > 0 ? ` (original: ${oldLines})` : ''}`)
 
       // Small pause between steps to avoid hitting rate limits
       if (idx < parsedTodos.length - 1 && !cancelRef.current) {
